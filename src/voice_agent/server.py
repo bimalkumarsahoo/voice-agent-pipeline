@@ -1,9 +1,13 @@
 """
-Minimal WebSocket server stub (Phase 0 smoke test).
+Server wired with the real ConversationPipeline (Phase 3).
 
-Right now it just accepts a connection, parses inbound messages into typed
-objects, and logs them. The real pipeline (STT->LLM->TTS, endpointing,
-barge-in) gets wired into the `handle_connection` loop in later phases.
+The pipeline (STT->LLM->TTS, streamed) replaces the Phase 1 EchoResponder,
+plugging into the same OutboundSender seam and the same on_audio /
+on_caller_stopped interface -- so handle_connection barely changed.
+
+NB: on_caller_stopped is currently fired on the `stop` event (whole-call =
+one turn). Phase 4 replaces that with real endpointing (silence detection)
+so a multi-turn conversation works mid-call.
 
 Run:  uv run python -m voice_agent.server
 """
@@ -16,24 +20,38 @@ import logging
 import websockets
 
 from voice_agent.protocol import (
-    StartMessage,
-    MediaMessage,
-    StopMessage,
-    parse_inbound,
+    StartMessage, MediaMessage, StopMessage,
+    parse_inbound, outbound_media, outbound_mark,
 )
+from voice_agent.stages import MockSTT, MockLLM, MockTTS
+from voice_agent.pipeline import ConversationPipeline
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice_agent")
 
-HOST = "0.0.0.0"
-PORT = 8080
+HOST, PORT = "0.0.0.0", 8080
+
+
+class OutboundSender:
+    def __init__(self, websocket, stream_sid: str):
+        self._ws = websocket
+        self._stream_sid = stream_sid
+
+    async def send_audio(self, mulaw: bytes) -> None:
+        await self._ws.send(outbound_media(self._stream_sid, mulaw))
+
+    async def send_mark(self, name: str) -> None:
+        await self._ws.send(outbound_mark(self._stream_sid, name))
+
+
+def build_pipeline(sender: OutboundSender) -> ConversationPipeline:
+    """One place to wire stages. Swap a Mock* for a real provider here."""
+    return ConversationPipeline(sender, MockSTT(), MockLLM(), MockTTS())
 
 
 async def handle_connection(websocket):
-    """One coroutine per call. Reads inbound frames and dispatches by type."""
+    sender = None
+    pipeline = None
     stream_sid = None
     frame_count = 0
 
@@ -42,32 +60,29 @@ async def handle_connection(websocket):
 
         if isinstance(msg, StartMessage):
             stream_sid = msg.stream_sid
-            log.info(
-                "START stream=%s encoding=%s rate=%d",
-                msg.stream_sid, msg.encoding, msg.sample_rate,
-            )
+            sender = OutboundSender(websocket, stream_sid)
+            pipeline = build_pipeline(sender)
+            log.info("START stream=%s rate=%d", msg.stream_sid, msg.sample_rate)
 
         elif isinstance(msg, MediaMessage):
+            if pipeline is None:
+                continue
             frame_count += 1
-            # Phase 2+: decode mu-law -> resample -> feed VAD/STT here.
-            if frame_count % 50 == 0:  # log every ~1s of audio
-                log.info("MEDIA frames=%d (%d bytes last)",
-                         frame_count, len(msg.audio))
+            await pipeline.on_audio(msg.audio)
 
         elif isinstance(msg, StopMessage):
-            log.info("STOP stream=%s total_frames=%d", stream_sid, frame_count)
+            log.info("STOP stream=%s frames=%d -> caller turn ended", stream_sid, frame_count)
+            if pipeline is not None:
+                await pipeline.on_caller_stopped()
             break
-
-        else:
-            log.warning("Unknown inbound message ignored")
 
     log.info("Connection closed (stream=%s)", stream_sid)
 
 
 async def main():
-    log.info("Voice agent server listening on ws://%s:%d", HOST, PORT)
+    log.info("Voice agent server (pipeline) on ws://%s:%d", HOST, PORT)
     async with websockets.serve(handle_connection, HOST, PORT):
-        await asyncio.Future()  # run forever
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
