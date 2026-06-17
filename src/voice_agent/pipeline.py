@@ -1,23 +1,22 @@
 """
-Phase 3: the conversational pipeline -- replaces EchoResponder.
+Phase 5: full-duplex conversational pipeline with barge-in.
 
-Orchestrates: caller audio -> STT -> LLM (streamed) -> sentence-chunking ->
-TTS (streamed) -> OutboundEncoder -> 20ms mu-law frames -> caller.
+caller audio -> endpointer (turn end) -> STT -> LLM (streamed) -> sentence
+chunking -> TTS (streamed) -> encode -> 20ms mu-law -> caller.
 
-The streaming property (assessment requirement 4): we do NOT wait for the full
-LLM reply. We accumulate streamed tokens until we have a complete sentence, then
-fire it into TTS immediately and stream that audio out -- so the caller hears
-sentence 1 while the LLM is still producing sentence 2.
+Phase 5 changes (vs Phase 4):
+  * FULL-DUPLEX: we no longer `await` the reply inline. The reply runs as a
+    background task while on_audio keeps processing inbound frames -- so the
+    caller can interrupt mid-reply.
+  * BARGE-IN: while the agent is speaking, inbound frames feed a BargeInDetector.
+    On sustained caller speech we (1) cancel the reply task, (2) flush queued
+    outbound audio, (3) send `clear` to the telephony side. The agent stops
+    immediately and does not finish its old sentence.
+  * Anti-self-trigger: barge-in requires SUSTAINED speech (not one frame), and
+    inbound/outbound are separate streams, so the agent never barges in on
+    itself. (Real shared-acoustic deployments would add echo cancellation.)
 
-This class exposes the SAME interface EchoResponder did:
-    on_audio(frame)        -- inbound 20ms mu-law frame (caller speaking)
-    on_caller_stopped()    -- endpoint detected: caller's turn ended, agent replies
-so swapping it into the server is a one-line change.
-
-NB: turn-taking (when on_caller_stopped fires) is Phase 4. Cancellation /
-barge-in (interrupting a reply in progress) is Phase 5. Here we build the clean
-forward path and structure the reply as a single cancellable task so Phase 5 can
-cancel it without restructuring.
+Seam unchanged: on_audio(frame), on_stop().
 """
 
 from __future__ import annotations
@@ -28,79 +27,118 @@ import re
 
 from voice_agent.utils import audio
 from voice_agent.stages import STT, LLM, TTS
+from voice_agent.vad import Endpointer, EndpointConfig
+from voice_agent.barge_in import BargeInDetector, BargeInConfig
 
 log = logging.getLogger("voice_agent.pipeline")
 
-# A sentence boundary: ., ?, ! optionally followed by space. Good enough to
-# chunk an LLM stream into speakable units without waiting for the whole reply.
 _SENTENCE_END = re.compile(r"[.?!]+")
 
 
 class ConversationPipeline:
-    def __init__(self, sender, stt: STT, llm: LLM, tts: TTS):
-        self._sender = sender          # OutboundSender (send_audio / send_mark)
+    def __init__(self, sender, stt: STT, llm: LLM, tts: TTS,
+                 endpoint_config: EndpointConfig | None = None,
+                 bargein_config: BargeInConfig | None = None):
+        self._sender = sender
         self._stt = stt
         self._llm = llm
         self._tts = tts
 
-        # Inbound audio for the current turn, decoded to 16kHz PCM for STT.
         self._inbound = audio.InboundDecoder()
+        self._endpointer = Endpointer(endpoint_config)
+        self._bargein = BargeInDetector(bargein_config)
         self._turn_pcm = bytearray()
 
-        # Reuse one outbound encoder + reframer for the whole call (state-continuous).
         self._encoder = audio.OutboundEncoder()
         self._reframer = audio.Reframer(audio.TELEPHONY_FRAME_BYTES)
 
-        # Handle to the in-flight reply task (Phase 5 will cancel this).
         self._reply_task: asyncio.Task | None = None
+        self._agent_speaking = False
 
-    # --- inbound -----------------------------------------------------------
+    # --- inbound: now full-duplex ------------------------------------------
 
     async def on_audio(self, mulaw_frame: bytes) -> None:
-        """Caller audio frame: decode to PCM and accumulate for this turn."""
         pcm = self._inbound.decode(mulaw_frame)
+
+        if self._agent_speaking:
+            # Agent is talking: watch ONLY for a barge-in (caller interrupting).
+            if self._bargein.update(pcm):
+                await self._handle_barge_in()
+                # The interrupting speech is the START of the caller's next turn;
+                # begin accumulating it so we don't lose the first words.
+                self._turn_pcm.extend(pcm)
+            return
+
+        # Agent idle: normal turn accumulation + endpointing.
         self._turn_pcm.extend(pcm)
+        if self._endpointer.update(pcm):
+            self._start_reply()  # fire-and-forget; do NOT await (full-duplex)
 
-    async def on_caller_stopped(self) -> None:
-        """Endpoint: the caller finished. Run STT -> LLM -> TTS for the reply.
+    async def on_stop(self) -> None:
+        """Call ended. Cancel any in-flight reply and stop cleanly."""
+        if self._reply_task is not None and not self._reply_task.done():
+            self._reply_task.cancel()
+            try:
+                await self._reply_task
+            except asyncio.CancelledError:
+                pass
 
-        Structured as one cancellable task so Phase 5 barge-in can cancel it.
-        """
+    # --- barge-in handling -------------------------------------------------
+
+    async def _handle_barge_in(self) -> None:
+        log.info("BARGE-IN detected -> cancelling reply, flushing, clearing")
+        # 1. Cancel in-flight generation/synthesis.
+        if self._reply_task is not None and not self._reply_task.done():
+            self._reply_task.cancel()
+            try:
+                await self._reply_task
+            except asyncio.CancelledError:
+                pass
+        # 2 + 3. Flush queued outbound audio and tell the far side to drop its
+        #        buffered audio (the `clear` event).
+        await self._sender.clear()
+        # _agent_speaking is cleared by _run_reply's finally; ensure it here too.
+        self._agent_speaking = False
+        # Reset detectors for the caller's new turn.
+        self._bargein.reset()
+        self._endpointer.new_turn()
+
+    # --- reply trigger (fire-and-forget) -----------------------------------
+
+    def _start_reply(self) -> None:
         turn = bytes(self._turn_pcm)
         self._turn_pcm.clear()
         if not turn:
+            self._endpointer.new_turn()
             return
+        self._bargein.reset()
         self._reply_task = asyncio.create_task(self._run_reply(turn))
-        await self._reply_task
-
-    # --- the reply path ----------------------------------------------------
 
     async def _run_reply(self, turn_pcm: bytes) -> None:
         try:
+            self._agent_speaking = True
             transcript = await self._stt.transcribe(turn_pcm)
             log.info("STT: %r", transcript)
 
             sentence = ""
             async for token in self._llm.generate(transcript):
                 sentence += token
-                # When we hit a sentence boundary, ship that sentence to TTS now.
                 if _SENTENCE_END.search(token):
                     await self._speak(sentence.strip())
                     sentence = ""
-            # Flush any trailing partial sentence.
             if sentence.strip():
                 await self._speak(sentence.strip())
 
-            # Mark end of the agent's turn so the client knows playback is done.
             await self._sender.send_mark("agent_turn_complete")
             log.info("Reply complete")
         except asyncio.CancelledError:
-            # Phase 5: barge-in cancels us here. Re-raise after any cleanup.
             log.info("Reply cancelled (barge-in)")
             raise
+        finally:
+            self._agent_speaking = False
+            self._endpointer.new_turn()
 
     async def _speak(self, sentence: str) -> None:
-        """Stream one sentence through TTS -> encode -> 20ms frames -> out."""
         if not sentence:
             return
         log.info("TTS <- %r", sentence)
@@ -108,7 +146,6 @@ class ConversationPipeline:
             mulaw = self._encoder.encode(pcm_chunk)
             for frame in self._reframer.push(mulaw):
                 await self._sender.send_audio(frame)
-        # Push any remainder as a final (sub-20ms) frame for this sentence.
         rem = self._reframer.flush()
         if rem:
             await self._sender.send_audio(rem)
