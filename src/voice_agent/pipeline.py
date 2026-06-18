@@ -29,6 +29,7 @@ from voice_agent.utils import audio
 from voice_agent.stages import STT, LLM, TTS
 from voice_agent.vad import Endpointer, EndpointConfig
 from voice_agent.barge_in import BargeInDetector, BargeInConfig
+from voice_agent.utils.timing import TurnTimer
 
 log = logging.getLogger("voice_agent.pipeline")
 
@@ -54,6 +55,7 @@ class ConversationPipeline:
 
         self._reply_task: asyncio.Task | None = None
         self._agent_speaking = False
+        self._timer: TurnTimer | None = None
 
     # --- inbound: now full-duplex ------------------------------------------
 
@@ -112,16 +114,20 @@ class ConversationPipeline:
             self._endpointer.new_turn()
             return
         self._bargein.reset()
+        self._timer = TurnTimer()
+        self._timer.mark("endpoint")
         self._reply_task = asyncio.create_task(self._run_reply(turn))
 
     async def _run_reply(self, turn_pcm: bytes) -> None:
         try:
             self._agent_speaking = True
             transcript = await self._stt.transcribe(turn_pcm)
+            if self._timer: self._timer.mark("stt_done")
             log.info("STT: %r", transcript)
 
             sentence = ""
             async for token in self._llm.generate(transcript):
+                if self._timer: self._timer.mark("first_token")
                 sentence += token
                 if _SENTENCE_END.search(token):
                     await self._speak(sentence.strip())
@@ -130,6 +136,9 @@ class ConversationPipeline:
                 await self._speak(sentence.strip())
 
             await self._sender.send_mark("agent_turn_complete")
+            if self._timer:
+                self._timer.mark("reply_done")
+                self._timer.log_report()
             log.info("Reply complete")
         except asyncio.CancelledError:
             log.info("Reply cancelled (barge-in)")
@@ -145,6 +154,7 @@ class ConversationPipeline:
         async for pcm_chunk in self._tts.synthesize(sentence):
             mulaw = self._encoder.encode(pcm_chunk)
             for frame in self._reframer.push(mulaw):
+                if self._timer: self._timer.mark("first_audio")
                 await self._sender.send_audio(frame)
         rem = self._reframer.flush()
         if rem:
