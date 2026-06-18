@@ -181,3 +181,7 @@ Time spent: roughly a focused day. Deliberately skipped: real provider
 integrations, the stretch goals (answering-machine detection, tool calls,
 reconnect, metrics dashboard), and broad test coverage. Mainly focused on the
 real-time pipeline, barge-in, and streaming.
+
+Video links:
+Short demo: https://drive.google.com/file/d/1PnJnxHgBr6Czdn5IlIvjOodiPBkGd6J5/view?usp=sharing
+Full video: https://drive.google.com/file/d/1NeGA7IHtI55EUnnKRgwoZD00f6XV73MY/view?usp=sharing
