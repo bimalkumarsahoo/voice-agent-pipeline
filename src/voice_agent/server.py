@@ -1,5 +1,9 @@
 """
-Server wired with the full-duplex ConversationPipeline + barge-in (Phase 5).
+WebSocket server entry point.
+
+Accepts call connections and runs one ConversationPipeline per call. Outbound
+audio goes through OutboundSender, which buffers frames in a bounded queue
+drained by a background task so barge-in can flush undelivered audio.
 
 Run:  uv run python -m voice_agent.server
 """
@@ -25,22 +29,25 @@ HOST, PORT = "0.0.0.0", 8080
 
 
 class OutboundSender:
-    """Sends audio/marks/clear to the caller.
+    """Sends audio / marks / clear to the caller.
 
-    Outbound audio is sent through a bounded queue drained by a background
-    task. This gives barge-in a real "flush queued audio" operation: on clear()
-    we empty the queue so frames already produced but not yet sent are DROPPED,
-    then emit the `clear` event so the far side discards what it has buffered.
-    Without the queue, "flush" would be a no-op because frames go straight out.
+    Audio is queued and drained by a background task so that, on barge-in,
+    clear() can drop frames that were produced but not yet sent. The queue is
+    bounded; under pressure the oldest frame is dropped in favour of the newest.
+
+    websocket:  the open connection.
+    stream_sid: id echoed back in every outbound message.
     """
 
     def __init__(self, websocket, stream_sid: str):
         self._ws = websocket
         self._stream_sid = stream_sid
+        # maxsize is in FRAMES (each ~20ms); 400 frames ~= 8s of headroom.
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=400)
         self._drain_task = asyncio.create_task(self._drain())
 
     async def _drain(self):
+        """Continuously send queued audio frames over the WebSocket."""
         try:
             while True:
                 mulaw = await self._queue.get()
@@ -49,12 +56,12 @@ class OutboundSender:
             raise
 
     async def send_audio(self, mulaw: bytes) -> None:
+        """Enqueue one outbound audio frame (drop-oldest if the queue is full)."""
         try:
             self._queue.put_nowait(mulaw)
         except asyncio.QueueFull:
-            # Bounded buffer: drop oldest, keep freshest (stale audio is useless).
             try:
-                self._queue.get_nowait()
+                self._queue.get_nowait()       # drop oldest, keep freshest
                 self._queue.put_nowait(mulaw)
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
@@ -63,7 +70,7 @@ class OutboundSender:
         await self._ws.send(outbound_mark(self._stream_sid, name))
 
     async def clear(self) -> None:
-        """Barge-in flush: drop all queued outbound audio, then send `clear`."""
+        """Drop all queued outbound audio, then send the clear event."""
         dropped = 0
         while not self._queue.empty():
             try:
@@ -75,6 +82,7 @@ class OutboundSender:
         log.info("CLEAR sent (dropped %d queued frames)", dropped)
 
     async def aclose(self):
+        """Stop the drain task."""
         self._drain_task.cancel()
         try:
             await self._drain_task
@@ -83,11 +91,12 @@ class OutboundSender:
 
 
 def build_pipeline(sender: OutboundSender) -> ConversationPipeline:
-    """One place to wire stages. Swap a Mock* for a real provider here."""
+    """Wire the pipeline stages. Swap a Mock* for a real provider here."""
     return ConversationPipeline(sender, MockSTT(), MockLLM(), MockTTS())
 
 
 async def handle_connection(websocket):
+    """One coroutine per call: dispatch inbound events to the pipeline."""
     sender = None
     pipeline = None
     stream_sid = None
@@ -110,7 +119,7 @@ async def handle_connection(websocket):
                 await pipeline.on_audio(msg.audio)
 
             elif isinstance(msg, StopMessage):
-                log.info("STOP stream=%s frames=%d -> call ended", stream_sid, frame_count)
+                log.info("STOP stream=%s frames=%d", stream_sid, frame_count)
                 if pipeline is not None:
                     await pipeline.on_stop()
                 break
@@ -122,7 +131,7 @@ async def handle_connection(websocket):
 
 
 async def main():
-    log.info("Voice agent server (full-duplex + barge-in) on ws://%s:%d", HOST, PORT)
+    log.info("Voice agent server on ws://%s:%d", HOST, PORT)
     async with websockets.serve(handle_connection, HOST, PORT):
         await asyncio.Future()
 

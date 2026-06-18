@@ -1,24 +1,15 @@
 """
-Phase 6: per-turn latency instrumentation.
+Per-turn latency instrumentation.
 
-Requirement 5 asks for per-stage timings, especially time-to-first-audio-byte
-(caller stops speaking -> caller hears first sound). This records named marks
-during a turn and reports the breakdown as one clean log line.
+Records named timestamps during a turn and reports the per-stage breakdown,
+including time-to-first-audio (caller stops speaking -> caller hears first sound).
 
 Marks recorded per turn:
-    endpoint      caller's turn ended (this is t=0 for time-to-first-audio)
-    stt_done      transcript ready
-    first_token   first LLM token arrived
-    first_audio   first outbound audio frame handed to the sender  <-- TTFA
-    reply_done    agent finished the whole reply
-
-Honest notes (for the README):
-  - Numbers reflect the MOCK stage delays (faked deliberately, per the spec), so
-    they characterise the ARCHITECTURE's timing behaviour, not real-model speed.
-  - time-to-first-audio measured here is from endpoint (caller stopped). The
-    ~600ms endpoint hangover is a separate, configurable turn-taking dial; the
-    report shows TTFA from endpoint so the hangover is excluded from these stage
-    numbers (the hangover happens before 'endpoint' is marked).
+    endpoint     caller's turn ended (t=0 for time-to-first-audio)
+    stt_done     transcript ready
+    first_token  first LLM token arrived
+    first_audio  first outbound audio frame handed to the sender
+    reply_done   agent finished the whole reply
 """
 
 from __future__ import annotations
@@ -36,7 +27,7 @@ class TurnTimer:
         self._marks: dict[str, float] = {}
 
     def mark(self, name: str) -> None:
-        # Record only the FIRST occurrence of a mark (e.g. first_token/first_audio).
+        """Record the first occurrence of a named mark (later repeats ignored)."""
         if name not in self._marks:
             self._marks[name] = time.monotonic()
 
@@ -46,7 +37,7 @@ class TurnTimer:
         return None
 
     def report(self) -> str:
-        """One-line per-stage breakdown anchored at 'endpoint'."""
+        """One-line per-stage breakdown anchored at the endpoint mark."""
         def seg(a, b):
             d = self._delta_ms(a, b)
             return f"{d}ms" if d is not None else "n/a"

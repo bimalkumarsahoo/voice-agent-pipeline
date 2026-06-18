@@ -1,20 +1,12 @@
 """
-Phase 2: audio plumbing -- the single boundary between the telephony format
-(8kHz mono mu-law, what the wire speaks) and the model format (16kHz linear
-PCM, what STT/TTS want).
+Audio format helpers: conversion between the telephony wire format and the model
+format used by STT/TTS.
 
-Everything audio-format-related lives here so the rest of the pipeline never
-touches audioop directly. Two worlds:
+    Wire:   8 kHz, mono, mu-law (G.711), 1 byte/sample
+    Model:  16 kHz, mono, linear PCM, 16-bit (2 bytes/sample)
 
-    TELEPHONY (wire):  8000 Hz, mono, mu-law (G.711), 1 byte/sample
-    MODEL (STT/TTS):   16000 Hz, mono, linear PCM, 16-bit (2 bytes/sample)
-
-Why two resampling paths:
-    audioop.ratecv is STATEFUL -- it carries filter state between calls. For a
-    continuous stream resampled frame-by-frame, you MUST thread that state
-    through or you get audible clicks at every frame boundary. So we expose:
-      - convert_* one-shot helpers for whole buffers (e.g. a full TTS utterance)
-      - StreamResampler for frame-by-frame streaming (e.g. the live inbound feed)
+Provides one-shot conversion for complete buffers and stateful streaming codecs
+for continuous frame-by-frame audio.
 """
 
 from __future__ import annotations
@@ -22,29 +14,26 @@ from __future__ import annotations
 import audioop
 from dataclasses import dataclass
 
-# --- Canonical formats -----------------------------------------------------
-
 TELEPHONY_RATE = 8000
 MODEL_RATE = 16000
 SAMPLE_WIDTH = 2          # 16-bit linear PCM
 CHANNELS = 1
 FRAME_MS = 20
-# 20ms frame sizes in each world
-TELEPHONY_FRAME_BYTES = TELEPHONY_RATE * FRAME_MS // 1000        # 160 mu-law bytes
-MODEL_FRAME_BYTES = MODEL_RATE * FRAME_MS // 1000 * SAMPLE_WIDTH  # 640 PCM bytes
+TELEPHONY_FRAME_BYTES = TELEPHONY_RATE * FRAME_MS // 1000        # 160 mu-law bytes / 20ms
+MODEL_FRAME_BYTES = MODEL_RATE * FRAME_MS // 1000 * SAMPLE_WIDTH  # 640 PCM bytes / 20ms
 
 
 # --- One-shot conversions (stateless; for complete buffers) ----------------
 
 def mulaw_to_pcm(mulaw: bytes) -> bytes:
-    """8kHz mu-law -> 16kHz 16-bit PCM. Use for a complete buffer."""
+    """Convert a complete 8kHz mu-law buffer to 16kHz 16-bit PCM."""
     pcm8 = audioop.ulaw2lin(mulaw, SAMPLE_WIDTH)
     pcm16, _ = audioop.ratecv(pcm8, SAMPLE_WIDTH, CHANNELS, TELEPHONY_RATE, MODEL_RATE, None)
     return pcm16
 
 
 def pcm_to_mulaw(pcm: bytes) -> bytes:
-    """16kHz 16-bit PCM -> 8kHz mu-law. Use for a complete buffer."""
+    """Convert a complete 16kHz 16-bit PCM buffer to 8kHz mu-law."""
     pcm8, _ = audioop.ratecv(pcm, SAMPLE_WIDTH, CHANNELS, MODEL_RATE, TELEPHONY_RATE, None)
     return audioop.lin2ulaw(pcm8, SAMPLE_WIDTH)
 
@@ -52,14 +41,18 @@ def pcm_to_mulaw(pcm: bytes) -> bytes:
 # --- Streaming resamplers (stateful; for frame-by-frame) -------------------
 
 class StreamResampler:
-    """Stateful resampler for a continuous stream. Create ONE per stream/direction
-    and feed frames in order; it threads ratecv state to avoid boundary clicks.
+    """Resamples a continuous stream frame-by-frame.
+
+    audioop.ratecv carries filter state between calls; this threads that state so
+    a stream resampled in chunks matches resampling the whole buffer at once
+    (otherwise artifacts appear at every frame boundary). One instance per
+    stream/direction.
     """
 
     def __init__(self, from_rate: int, to_rate: int):
         self._from = from_rate
         self._to = to_rate
-        self._state = None
+        self._state = None  # ratecv state, threaded across calls
 
     def process(self, pcm: bytes) -> bytes:
         out, self._state = audioop.ratecv(
@@ -69,7 +62,7 @@ class StreamResampler:
 
 
 class InboundDecoder:
-    """Streaming inbound path: mu-law 8kHz frames -> 16kHz PCM, click-free."""
+    """Streaming inbound codec: mu-law 8kHz frames -> 16kHz PCM, artifact-free."""
 
     def __init__(self):
         self._resampler = StreamResampler(TELEPHONY_RATE, MODEL_RATE)
@@ -80,7 +73,7 @@ class InboundDecoder:
 
 
 class OutboundEncoder:
-    """Streaming outbound path: 16kHz PCM -> mu-law 8kHz frames, click-free."""
+    """Streaming outbound codec: 16kHz PCM -> mu-law 8kHz frames, artifact-free."""
 
     def __init__(self):
         self._resampler = StreamResampler(MODEL_RATE, TELEPHONY_RATE)
@@ -90,55 +83,29 @@ class OutboundEncoder:
         return audioop.lin2ulaw(pcm8, SAMPLE_WIDTH)
 
 
-# --- WAV / arbitrary-source normalization ----------------------------------
-
-def normalize_to_telephony_mulaw(
-        pcm: bytes, src_rate: int, src_width: int, src_channels: int
-) -> bytes:
-    """Convert arbitrary linear PCM (any rate/width/channels) to 8kHz mono mu-law.
-
-    Used when ingesting a source whose format we don't control (e.g. a WAV
-    file a user drops in). Steps: downmix -> 16-bit -> 8kHz -> mu-law.
-    Each step is no-op if already in the target form.
-    """
-    if src_channels == 2:
-        pcm = audioop.tomono(pcm, src_width, 0.5, 0.5)
-    if src_width != SAMPLE_WIDTH:
-        pcm = audioop.lin2lin(pcm, src_width, SAMPLE_WIDTH)
-    if src_rate != TELEPHONY_RATE:
-        pcm, _ = audioop.ratecv(pcm, SAMPLE_WIDTH, CHANNELS, src_rate, TELEPHONY_RATE, None)
-    return audioop.lin2ulaw(pcm, SAMPLE_WIDTH)
-
-
-def chunk_frames(data: bytes, frame_bytes: int) -> list[bytes]:
-    """Split a buffer into fixed-size frames. A trailing short frame is kept."""
-    return [data[i : i + frame_bytes] for i in range(0, len(data), frame_bytes)]
-
-
-# --- Energy / silence measurement (Phase 4 endpointing will use this) ------
+# --- Energy / reframing ----------------------------------------------------
 
 def frame_energy(pcm: bytes) -> int:
-    """RMS energy of a 16-bit PCM buffer. Used by the VAD for silence detection."""
+    """RMS energy of a 16-bit PCM buffer; used for silence/speech detection."""
     if not pcm:
         return 0
     return audioop.rms(pcm, SAMPLE_WIDTH)
 
 
-# --- Reframing helper ------------------------------------------------------
-
 @dataclass
 class Reframer:
     """Buffers a byte stream and emits fixed-size frames.
 
-    STT/TTS chunks and resampler outputs rarely land on clean 20ms boundaries.
-    This accumulates bytes and yields complete frames of `frame_bytes`, holding
-    the remainder for next time.
+    Codec / resampler output rarely lands on clean frame boundaries; this
+    accumulates bytes, yields complete frames of `frame_bytes`, and holds the
+    remainder for next time.
     """
 
     frame_bytes: int
     _buf: bytes = b""
 
     def push(self, data: bytes) -> list[bytes]:
+        """Add bytes; return any complete frames now available."""
         self._buf += data
         frames = []
         while len(self._buf) >= self.frame_bytes:
@@ -147,6 +114,6 @@ class Reframer:
         return frames
 
     def flush(self) -> bytes:
-        """Return any partial remainder (pad-and-send at end of utterance)."""
+        """Return any partial remainder and clear the buffer."""
         rem, self._buf = self._buf, b""
         return rem
