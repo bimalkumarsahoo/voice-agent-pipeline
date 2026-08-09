@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package voiceagent.v1;
+
+// One bidirectional stream per TURN. The orchestrator opens it at endpoint
+// (caller stopped speaking), streams audio in, receives events out, and
+// cancels the call natively for barge-in (no cancel message needed).
+service Converse {
+  rpc Converse(stream ClientEvent) returns (stream ServerEvent);
+}
+
+// ---- Orchestrator -> Gateway ----
+message ClientEvent {
+  oneof event {
+    Start start = 1;         // MUST be the first message on the stream
+    AudioFrame audio = 2;    // then: many bare audio frames
+  }
+}
+
+// The "envelope header" — sent once, first. Tells the gateway which call this
+// turn belongs to and how to configure the pipeline. Not forwarded to LLM/TTS.
+message Start {
+  string call_sid = 1;       // threads through everything (design 3.8)
+  string codec = 2;          // e.g. "mulaw_8000"
+  bool rag_enabled = 3;      // toggle retrieval for this turn
+}
+
+message AudioFrame {
+  bytes payload = 1;         // µ-law/8kHz chunk; call_sid NOT repeated here
+}
+
+// ---- Gateway -> Orchestrator ----
+message ServerEvent {
+  oneof event {
+    PartialTranscript partial = 1;   // STT interim, may revise
+    FinalTranscript   final   = 2;   // STT done -> triggers RAG + LLM
+    FirstToken        first   = 3;   // latency marker: LLM started
+    AudioFrame        audio   = 4;   // TTS output, streamed back
+    TurnComplete      done    = 5;   // reply finished, stream can close
+  }
+}
+
+message PartialTranscript { string text = 1; }
+message FinalTranscript   { string text = 1; }
+message FirstToken        {}                     // marker only, no payload
+message TurnComplete      { string reason = 1; } // "complete" | "error" | "cancelled"
